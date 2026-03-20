@@ -1,0 +1,11 @@
+# StockVision — Tesla Stock Analysis App
+# Install with: pip install -r requirements.txt
+
+streamlit>=1.40.0
+pandas>=2.0.0
+numpy>=1.26.0
+plotly>=5.18.0
+scikit-learn>=1.3.0
+reportlab>=4.0.0
+matplotlib>=3.7.0
+kaleido>=0.2.1
