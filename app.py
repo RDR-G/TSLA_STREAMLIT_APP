@@ -532,7 +532,7 @@ def generate_sample_sql() -> bytes:
 def generate_report_pdf(df, model_bytes, ticker_name="Stock"):
     """
     Generate a polished, professional light-theme PDF report.
-    Covers Dashboard (key metrics, price history, drawdown, risk, insights)
+    Covers Market Overview (key metrics, price history, drawdown, risk, insights)
     and Prediction (model perf, actual vs predicted, train/test split, next-day forecast).
     Returns raw PDF bytes.
     """
@@ -765,7 +765,7 @@ def generate_report_pdf(df, model_bytes, ticker_name="Stock"):
         ["Dataset Range",     f"{df.index.min().date()}  \u2192  {df.index.max().date()}"],
         ["Total Trading Days",f"{len(df):,}"],
         ["Model",             "Linear Regression (pre-trained .pkl)"],
-        ["Sections",          "Dashboard  |  Risk Analysis  |  Model Prediction"],
+        ["Sections",          "Market Overview  |  Risk Analysis  |  Model Prediction"],
     ]
     ctbl = Table(cover_rows, colWidths=[4.5*cm, inner_w - 4.5*cm])
     ctbl.setStyle(TableStyle([
@@ -797,7 +797,7 @@ def generate_report_pdf(df, model_bytes, ticker_name="Stock"):
         S("Disc", fontSize=8, textColor=C_MUTED, alignment=TA_CENTER,
           fontName="Helvetica-Oblique")))
     story.append(PageBreak())
-    story.append(Paragraph("1. Dashboard", ST_H1))
+    story.append(Paragraph("1. Market Overview", ST_H1))
     story.append(hr(C_RED, thickness=1.5, space_after=10))
 
     story.append(section_bar("1.1  Key Performance Metrics"))
@@ -1271,7 +1271,7 @@ def generate_live_tesla_pdf(live_df, model_bytes, live_period="6mo", live_interv
                 change    = pred_next - last_close
                 pct_change = change / last_close * 100
                 signal    = "BUY" if pred_next > last_close else "SELL"
-                m_r2      = None   # not re-evaluated here to keep it fast
+                m_r2      = None  
                 pred_available = True
         except Exception:
             pred_available = False
@@ -1524,14 +1524,14 @@ info_msg     = None
 
 nav_tab4, nav_tab0, nav_tab1, nav_tab2, nav_tab3 = st.tabs([
     "⚡ Live Tesla",
-    "Data Source & Model",
-    "Dashboard",
-    "EDA",
-    "Prediction",
+    "Manual Stock",
+    "Market Overview",
+    "Insights",
+    "Price Forecasting",
 ])
 
 with nav_tab0:
-    st.markdown("<h2 style='margin-bottom:4px;'>Data Source &amp; Model Setup</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='margin-bottom:4px;'>Manual Stock Setup</h2>", unsafe_allow_html=True)
     st.markdown("<p style='color:#8b949e; margin-bottom:20px;'>Configure your prediction model and load stock data before exploring the dashboard.</p>", unsafe_allow_html=True)
 
     _col_model, _spacer, _col_src = st.columns([5, 1, 6])
@@ -1590,7 +1590,7 @@ with nav_tab0:
         else:
             st.markdown(
                 "<div class='warn-box'>⚠ No model loaded. Upload a <strong>.pkl</strong> file above "
-                "to enable the Prediction tab.</div>",
+                "to enable the Price Forecasting tab.</div>",
                 unsafe_allow_html=True
             )
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1628,7 +1628,7 @@ with nav_tab0:
         src_c1, src_c2 = st.columns([1, 2])
         source = src_c1.radio(
             "Select data source",
-            ["CSV", "JSON", "SQL Database", "Google Drive", "Live Tesla Data"],
+            ["CSV", "JSON", "SQL Database"],
             label_visibility="collapsed"
         )
 
@@ -1717,89 +1717,6 @@ with nav_tab0:
                     except Exception as e:
                         load_error = f"Failed to read SQL file: {e}"
 
-            elif source == "Google Drive":
-                source_label = "Drive"
-                drive_url = st.text_input(
-                    "Paste Google Drive share link",
-                    placeholder="https://drive.google.com/file/d/.../view?usp=sharing",
-                    key="drive_url"
-                )
-                drive_fmt = st.selectbox(
-                    "File format",
-                    ["CSV", "JSON"],
-                    key="drive_fmt",
-                    help="Select the format of the file in Drive"
-                )
-                load_drive_btn = st.button("Load from Drive", key="drive_btn")
-
-                if load_drive_btn and drive_url.strip():
-                    with st.spinner("Downloading from Google Drive…"):
-                        try:
-                            content = _load_drive(drive_url.strip(), drive_fmt)
-                            if drive_fmt == "CSV":
-                                raw_df = pd.read_csv(io.BytesIO(content))
-                            else:
-                                raw_df = pd.read_json(io.BytesIO(content))
-                            df, msg = validate_and_prepare(raw_df)
-                            if df is None:
-                                load_error = msg
-                            else:
-                                info_msg = msg
-                            if df is not None:
-                                _drive_name = drive_url.strip().rstrip('/').split('/')[-1]
-                                _drive_name = re.sub(r'[?&].*', '', _drive_name)
-                                _drive_name = os.path.splitext(_drive_name)[0].upper().replace('_', ' ').replace('-', ' ') or "STOCK"
-                                st.session_state['ticker_name'] = _drive_name
-                            st.session_state['drive_df']   = df
-                            st.session_state['drive_err']  = load_error
-                            st.session_state['drive_info'] = info_msg
-                        except Exception as e:
-                            load_error = f"Drive download failed: {e}"
-                            st.session_state['drive_err'] = load_error
-                            st.session_state['drive_df']  = None
-
-                if df is None and 'drive_df' in st.session_state:
-                    df         = st.session_state.get('drive_df')
-                    load_error = st.session_state.get('drive_err')
-                    info_msg   = st.session_state.get('drive_info')
-
-                if not drive_url.strip():
-                    st.caption("Make sure the file is shared as **Anyone with the link**.")
-
-            elif source == "Live Tesla Data":
-                source_label = "LIVE"
-                if not _YF_AVAILABLE:
-                    st.markdown(
-                        "<div class='warn-box'>⚠ <strong>yfinance</strong> is not installed. "
-                        "Run <code>pip install yfinance</code> and restart the app.</div>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    live_period_col, live_intv_col = st.columns(2)
-                    _live_period = live_period_col.selectbox(
-                        "Period", ["1mo", "3mo", "6mo", "1y", "2y"],
-                        index=2, key="live_period_src"
-                    )
-                    _live_intv = live_intv_col.selectbox(
-                        "Interval", ["1d", "1wk"],
-                        index=0, key="live_intv_src"
-                    )
-                    _fetch_btn = st.button("🔄 Fetch Live TSLA Data", key="fetch_live_src")
-                    if _fetch_btn or st.session_state.get("live_df") is None:
-                        with st.spinner("Fetching live Tesla (TSLA) data…"):
-                            _live_df, _live_err = fetch_live_tsla_data(_live_period, _live_intv)
-                        st.session_state["live_df"]  = _live_df
-                        st.session_state["live_err"] = _live_err
-
-                    df        = st.session_state.get("live_df")
-                    load_error = st.session_state.get("live_err") if df is None else None
-                    if df is not None:
-                        st.session_state["ticker_name"] = "TESLA (LIVE)"
-                        info_msg = (
-                            f"Live TSLA data: {len(df):,} rows · "
-                            f"{df.index.min().date()} → {df.index.max().date()}"
-                        )
-
         if load_error:
             st.markdown(f"<div class='warn-box'>{load_error}</div>", unsafe_allow_html=True)
         elif df is not None:
@@ -1829,8 +1746,8 @@ with nav_tab0:
     if df is not None:
         st.markdown("""
         <div class='success-box' style='margin-top:16px; font-size:14px;'>
-        ✅ <strong>Setup complete!</strong> Switch to the <strong>Dashboard</strong>,
-        <strong>EDA</strong>, or <strong>Prediction</strong> tabs to explore your data.
+        ✅ <strong>Setup complete!</strong> Switch to the <strong>Market Overview</strong>,
+        <strong>Insights</strong>, or <strong>Price Forecasting</strong> tabs to explore your data.
         </div>
         """, unsafe_allow_html=True)
     else:
@@ -1854,7 +1771,7 @@ with nav_tab4:
         st.error("yfinance is not installed. Run `pip install yfinance` and restart the app.")
         st.stop()
 
-    _period_default  = st.session_state.get("live_period_tab",  "6mo")
+    _period_default  = st.session_state.get("live_period_tab",  "5y")
     _interval_default = st.session_state.get("live_intv_tab",   "1d")
 
     with st.spinner("Loading live TSLA data…"):
@@ -1871,8 +1788,8 @@ with nav_tab4:
         st.markdown(f"<div class='warn-box'>ℹ {live_err}</div>", unsafe_allow_html=True)
 
     ctrl_c1, ctrl_c2, ctrl_c3, ctrl_c4 = st.columns([2, 2, 2, 2])
-    live_period   = ctrl_c1.selectbox("Data Period", ["1mo","3mo","6mo","1y","2y"],
-                                      index=["1mo","3mo","6mo","1y","2y"].index(_period_default),
+    live_period   = ctrl_c1.selectbox("Data Period", ["1mo","3mo","6mo","1y","2y","5y","max"],
+                                      index=["1mo","3mo","6mo","1y","2y","5y","max"].index(_period_default) if _period_default in ["1mo","3mo","6mo","1y","2y","5y","max"] else 5,
                                       key="live_period_tab")
     live_interval = ctrl_c2.selectbox("Interval",   ["1d","1h","5m"],
                                       index=["1d","1h","5m"].index(_interval_default),
@@ -1967,7 +1884,7 @@ with nav_tab4:
     if model_bytes is None:
         st.markdown(
             "<div class='warn-box'>⚠ No model loaded. Upload a <strong>.pkl</strong> model "
-            "in the <strong>Data Source &amp; Model</strong> tab to enable live predictions.</div>",
+            "in the <strong>Manual Stock</strong> tab to enable live predictions.</div>",
             unsafe_allow_html=True,
         )
     else:
@@ -2059,7 +1976,7 @@ with nav_tab4:
                     _recent = live_df[['Open','High','Low','Close','Volume']].tail(10).copy()
                     _recent.index = _recent.index.date
                     _recent['Daily Chg %'] = _recent['Close'].pct_change().mul(100).round(2)
-                    _recent = _recent.iloc[::-1]  # newest first
+                    _recent = _recent.iloc[::-1] 
                     st.dataframe(
                         _recent.style
                             .format({
@@ -2077,6 +1994,7 @@ with nav_tab4:
                             ),
                         use_container_width=True,
                     )
+
                     st.markdown("<div class='section-header'>Recent Volume Activity</div>", unsafe_allow_html=True)
                     _vol_data = live_df.tail(30).copy()
                     _vol_colors = [
@@ -2115,7 +2033,7 @@ with nav_tab4:
 if df is None:
     for _tab in [nav_tab1, nav_tab2, nav_tab3]:
         with _tab:
-            st.info("⚙️ Configure your data and model in the **Data Source & Model** tab to get started.")
+            st.info("⚙️ Configure your data and model in the **Manual Stock** tab to get started.")
 
 if df is None:
     st.stop()
@@ -2123,7 +2041,7 @@ if df is None:
 
 with nav_tab1:
     _ticker = st.session_state.get('ticker_name', 'Stock')
-    st.markdown(f"<h1>StockVision — {_ticker} Dashboard</h1>", unsafe_allow_html=True)
+    st.markdown(f"<h1>StockVision — {_ticker} Market Overview</h1>", unsafe_allow_html=True)
     st.markdown(
         f"<p>Comprehensive analysis of <strong>{_ticker}</strong> — "
         f"{df.index.min().date()} to {df.index.max().date()}</p>",
@@ -2372,7 +2290,7 @@ with nav_tab3:
     if model_bytes is None:
         st.warning(
             "**No model loaded.** Upload a `.pkl` model file using the "
-            "**Data Source & Model** panel above to enable predictions."
+            "**Manual Stock** panel above to enable predictions."
         )
         st.stop()
 
