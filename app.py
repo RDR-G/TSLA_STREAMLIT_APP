@@ -12,6 +12,13 @@ import re
 import io
 import warnings
 warnings.filterwarnings('ignore')
+import datetime
+
+try:
+    import yfinance as yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
 
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
@@ -373,6 +380,48 @@ def _load_drive(share_url: str, file_format: str) -> bytes:
                 "Make sure the file is shared with 'Anyone with the link'."
             )
     return content
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_live_tsla_data(period: str = "6mo", interval: str = "1d") -> tuple:
+    """
+    Fetch live TSLA data via yfinance.
+    Returns (prepared_df, error_or_None).
+    Cached for 5 minutes (ttl=300).
+    """
+    if not _YF_AVAILABLE:
+        return None, "yfinance is not installed. Run: pip install yfinance"
+    try:
+        raw = yf.download("TSLA", period=period, interval=interval,
+                          auto_adjust=True, progress=False)
+        if raw is None or len(raw) == 0:
+            return None, "yfinance returned no data for TSLA."
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [col[0] if isinstance(col, tuple) else col for col in raw.columns]
+
+        raw = raw.reset_index()
+
+        if 'Datetime' in raw.columns:
+            raw = raw.rename(columns={'Datetime': 'Date'})
+        elif 'Date' not in raw.columns:
+            raw.columns.values[0] = 'Date'
+
+        available = [c for c in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+                     if c in raw.columns]
+        missing_live = [c for c in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+                        if c not in raw.columns]
+        if missing_live:
+            return None, f"Live data missing columns: {missing_live}"
+
+        raw = raw[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        raw['Date'] = pd.to_datetime(raw['Date']).dt.tz_localize(None)
+
+        prepared, err = validate_and_prepare(raw)
+        return prepared, err
+
+    except Exception as exc:
+        return None, f"Failed to fetch live Tesla data: {exc}"
+
 
 @st.cache_data(show_spinner=False)
 def engineer_features(_df: pd.DataFrame) -> pd.DataFrame:
@@ -999,13 +1048,482 @@ def generate_report_pdf(df, model_bytes, ticker_name="Stock"):
     buf.seek(0)
     return buf.read()
 
+def generate_live_tesla_pdf(live_df, model_bytes, live_period="6mo", live_interval="1d"):
+    """
+    Generate a polished PDF report for the Live Tesla (TSLA) tab.
+    Sections:
+      1. Live Market Snapshot   — KPI cards
+      2. Tesla Live Price Trend — close price + MA20 chart
+      3. Next-Day Prediction    — metrics, Buy/Sell signal
+      4. Recent Trading Data    — last 10 trading days table
+      5. Volume Activity        — 30-day volume bar chart
+    Returns raw PDF bytes.
+    """
+    import io as _io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+    import matplotlib.patches as mpatches
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        PageBreak, HRFlowable, Image as RLImage, KeepTogether,
+    )
+
+    C_RED       = colors.HexColor("#c0392b")
+    C_RED_LIGHT = colors.HexColor("#f8d7da")
+    C_DARK      = colors.HexColor("#1a1a2e")
+    C_BODY      = colors.HexColor("#2c2c2c")
+    C_MUTED     = colors.HexColor("#666666")
+    C_BORDER    = colors.HexColor("#dee2e6")
+    C_ROW_ALT   = colors.HexColor("#f8f9fa")
+    C_ROW_MAIN  = colors.white
+    C_GREEN     = colors.HexColor("#27ae60")
+    C_ORANGE    = colors.HexColor("#e67e22")
+    C_CARD_BG   = colors.HexColor("#f0f4ff")
+
+    W, H = A4
+    L_MAR = R_MAR = 1.8 * cm
+    T_MAR = 3.4 * cm
+    B_MAR = 2.4 * cm
+    inner_w = W - L_MAR - R_MAR
+    now_str = datetime.datetime.now().strftime("%d %b %Y  %H:%M")
+    ticker_name = "TESLA (TSLA) — LIVE"
+
+    def _draw_hf(canv, doc):
+        canv.saveState()
+        band_h = 1.9 * cm
+        canv.setFillColor(C_RED)
+        canv.rect(0, H - band_h, W, band_h, fill=1, stroke=0)
+        canv.setFillColor(colors.white)
+        canv.setFont("Helvetica-Bold", 14)
+        canv.drawString(L_MAR, H - band_h + 0.65 * cm, "StockVision")
+        canv.setFont("Helvetica", 8)
+        canv.drawRightString(W - R_MAR, H - band_h + 1.05 * cm,
+                             f"{ticker_name}  |  Live Analysis Report")
+        canv.drawRightString(W - R_MAR, H - band_h + 0.35 * cm, now_str)
+        canv.setFillColor(C_MUTED)
+        canv.setFont("Helvetica", 7)
+        footer_y = 1.1 * cm
+        canv.drawString(L_MAR, footer_y,
+                        "Generated by StockVision  |  For informational purposes only — not investment advice.")
+        canv.drawRightString(W - R_MAR, footer_y, f"Page {doc.page}")
+        canv.setStrokeColor(C_BORDER)
+        canv.setLineWidth(0.5)
+        canv.line(L_MAR, footer_y + 0.45 * cm, W - R_MAR, footer_y + 0.45 * cm)
+        canv.restoreState()
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=L_MAR, rightMargin=R_MAR,
+                            topMargin=T_MAR, bottomMargin=B_MAR)
+
+    ss = getSampleStyleSheet()
+    def S(name, parent="Normal", **kw):
+        return ParagraphStyle(name, parent=ss[parent], **kw)
+
+    ST_COVER_TITLE = S("CT",  fontSize=34, textColor=C_RED,   fontName="Helvetica-Bold",
+                        alignment=TA_CENTER, leading=42, spaceAfter=10)
+    ST_COVER_SUB   = S("CS",  fontSize=13, textColor=C_MUTED, alignment=TA_CENTER,
+                        leading=18, spaceAfter=6)
+    ST_COVER_BODY  = S("CB",  fontSize=10, textColor=C_BODY,  alignment=TA_CENTER,
+                        leading=15, spaceAfter=4)
+    ST_H1    = S("H1",  fontSize=17, textColor=C_DARK, fontName="Helvetica-Bold",
+                  spaceBefore=6, spaceAfter=4, leading=22)
+    ST_BODY  = S("BO",  fontSize=9,  textColor=C_BODY, leading=15, spaceAfter=4)
+    ST_CAP   = S("CA",  fontSize=8,  textColor=C_MUTED, alignment=TA_CENTER,
+                  spaceBefore=4, spaceAfter=10, fontName="Helvetica-Oblique")
+    ST_CELL  = S("CE",  fontSize=9,  textColor=C_BODY)
+    ST_CELLB = S("CEB", fontSize=9,  textColor=C_BODY, fontName="Helvetica-Bold")
+    ST_LBL   = S("LB",  fontSize=8,  textColor=C_MUTED, alignment=TA_CENTER, spaceAfter=2)
+    ST_VAL   = S("VA",  fontSize=15, textColor=C_DARK, fontName="Helvetica-Bold",
+                  alignment=TA_CENTER, leading=19)
+    ST_DELTA_G = S("DG", fontSize=8, textColor=C_GREEN,  alignment=TA_CENTER, spaceAfter=2)
+    ST_DELTA_R = S("DR", fontSize=8, textColor=C_RED,    alignment=TA_CENTER, spaceAfter=2)
+    ST_FOOT  = S("FO",  fontSize=7,  textColor=C_MUTED,  alignment=TA_CENTER)
+    ST_SIG_BUY  = S("SB", fontSize=20, textColor=C_GREEN, fontName="Helvetica-Bold",
+                     alignment=TA_CENTER, leading=26)
+    ST_SIG_SELL = S("SS", fontSize=20, textColor=C_RED,   fontName="Helvetica-Bold",
+                     alignment=TA_CENTER, leading=26)
+
+    def hr(color=C_BORDER, thickness=0.8, space_before=0, space_after=8):
+        return HRFlowable(width="100%", thickness=thickness, color=color,
+                          spaceBefore=space_before, spaceAfter=space_after)
+
+    def section_bar(title):
+        tbl = Table([[Paragraph(f'<font color="white"><b>{title}</b></font>',
+                                S("SBr", fontSize=11, textColor=colors.white,
+                                  fontName="Helvetica-Bold", leading=14))]],
+                    colWidths=[inner_w])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,-1), C_RED),
+            ("TOPPADDING",    (0,0), (-1,-1), 8),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+            ("LEFTPADDING",   (0,0), (-1,-1), 14),
+        ]))
+        return tbl
+
+    def metric_cards(items, cols=4):
+        cw = inner_w / cols
+        cells = []
+        for label, value, delta in items:
+            if delta:
+                is_pos = not delta.startswith("-")
+                dp = Paragraph(delta, ST_DELTA_G if is_pos else ST_DELTA_R)
+            else:
+                dp = Paragraph("", ST_LBL)
+            inner = Table(
+                [[Paragraph(value, ST_VAL)], [dp], [Paragraph(label, ST_LBL)]],
+                colWidths=[cw - 12])
+            inner.setStyle(TableStyle([
+                ("ALIGN",  (0,0), (-1,-1), "CENTER"),
+                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                ("TOPPADDING",    (0,0), (-1,-1), 2),
+                ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+                ("LEFTPADDING",   (0,0), (-1,-1), 0),
+                ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+            ]))
+            cells.append(inner)
+        t = Table([cells], colWidths=[cw] * cols)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,-1), C_CARD_BG),
+            ("GRID",          (0,0), (-1,-1), 0.6, C_BORDER),
+            ("TOPPADDING",    (0,0), (-1,-1), 12),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 12),
+            ("LEFTPADDING",   (0,0), (-1,-1), 6),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 6),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+        ]))
+        return t
+
+    def data_table(headers, rows, col_widths=None):
+        if col_widths is None:
+            col_widths = [inner_w / len(headers)] * len(headers)
+        header_row = [Paragraph(f"<b>{h}</b>",
+                                S("TH2", fontSize=9, textColor=colors.white,
+                                  fontName="Helvetica-Bold")) for h in headers]
+        data_rows  = [[Paragraph(str(c), ST_CELL) for c in row] for row in rows]
+        t = Table([header_row] + data_rows, colWidths=col_widths, repeatRows=1)
+        style = [
+            ("BACKGROUND",    (0,0), (-1,0),  C_RED),
+            ("TEXTCOLOR",     (0,0), (-1,0),  colors.white),
+            ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
+            ("GRID",          (0,0), (-1,-1), 0.5, C_BORDER),
+            ("TOPPADDING",    (0,0), (-1,-1), 6),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+            ("LEFTPADDING",   (0,0), (-1,-1), 8),
+            ("FONTSIZE",      (0,0), (-1,-1), 9),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ]
+        for i in range(len(data_rows)):
+            bg = C_ROW_ALT if i % 2 == 0 else C_ROW_MAIN
+            style.append(("BACKGROUND", (0, i+1), (-1, i+1), bg))
+        t.setStyle(TableStyle(style))
+        return t
+
+    def fig_to_rl(fig, w_cm=15, h_cm=7):
+        ib = _io.BytesIO()
+        fig.savefig(ib, format="png", dpi=160, bbox_inches="tight",
+                    facecolor="white", edgecolor="none")
+        plt.close(fig)
+        ib.seek(0)
+        return RLImage(ib, width=w_cm * cm, height=h_cm * cm)
+
+    def mpl_style(ax, fig):
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("#f9f9fb")
+        ax.tick_params(colors="#555555", labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color("#cccccc")
+            sp.set_linewidth(0.6)
+        ax.grid(color="#e0e0e0", lw=0.5, linestyle="--")
+        ax.yaxis.label.set_color("#555555")
+        ax.xaxis.label.set_color("#555555")
+
+    last_close  = float(live_df['Close'].iloc[-1])
+    prev_close  = float(live_df['Close'].iloc[-2]) if len(live_df) > 1 else last_close
+    day_chg     = last_close - prev_close
+    day_pct     = (day_chg / prev_close * 100) if prev_close else 0
+    period_high = float(live_df['Close'].max())
+    period_low  = float(live_df['Close'].min())
+    avg_vol     = live_df['Volume'].mean()
+    data_from   = live_df.index.min().date()
+    data_to     = live_df.index.max().date()
+
+    pred_available = False
+    pred_next = change = pct_change = 0.0
+    signal = "N/A"
+    m_r2   = None
+    if model_bytes is not None and len(live_df) >= 60:
+        try:
+            _lm   = pickle.loads(model_bytes)
+            _feats = list(_lm.feature_names_in_)
+            _md   = engineer_features(live_df)
+            if all(f in _md.columns for f in _feats):
+                _row      = _md[_feats].iloc[-1].values.reshape(1, -1)
+                pred_next = float(_lm.predict(_row)[0])
+                change    = pred_next - last_close
+                pct_change = change / last_close * 100
+                signal    = "BUY" if pred_next > last_close else "SELL"
+                m_r2      = None   # not re-evaluated here to keep it fast
+                pred_available = True
+        except Exception:
+            pred_available = False
+
+    story = []
+
+    story.append(Spacer(1, 1.8 * cm))
+    story.append(Paragraph("StockVision", ST_COVER_TITLE))
+    story.append(Paragraph("Live Tesla (TSLA) Analysis Report", ST_COVER_SUB))
+    story.append(hr(C_RED, thickness=1.5, space_before=6, space_after=12))
+    story.append(Paragraph(f"Data period: <b>{live_period}</b> &nbsp;|&nbsp; "
+                            f"Interval: <b>{live_interval}</b> &nbsp;|&nbsp; "
+                            f"Rows: <b>{len(live_df):,}</b>", ST_COVER_BODY))
+    story.append(Paragraph(f"Coverage: <b>{data_from}</b> → <b>{data_to}</b>", ST_COVER_BODY))
+    story.append(Paragraph(f"Generated: <b>{now_str}</b>", ST_COVER_BODY))
+    story.append(Spacer(1, 0.5 * cm))
+    story.append(Paragraph(
+        "This report provides a real-time snapshot of Tesla Inc. (TSLA) stock data "
+        "fetched via Yahoo Finance, combined with next-day price prediction from a "
+        "pre-trained Linear Regression model. For informational purposes only — "
+        "not investment advice.",
+        ST_BODY))
+    story.append(PageBreak())
+
+    story.append(Paragraph("1. Live Market Snapshot", ST_H1))
+    story.append(hr(C_RED, thickness=1.5, space_after=10))
+    story.append(section_bar("1.1  Key Price Metrics"))
+    story.append(Spacer(1, 0.3 * cm))
+
+    day_delta_str = f"{day_chg:+.2f} ({day_pct:+.2f}%)"
+    kpi_items = [
+        ("Latest Close",     f"${last_close:,.2f}",   day_delta_str),
+        ("Period High",      f"${period_high:,.2f}",  None),
+        ("Period Low",       f"${period_low:,.2f}",   None),
+        ("Avg Daily Volume", f"{avg_vol/1e6:.1f}M",   None),
+    ]
+    story.append(metric_cards(kpi_items, cols=4))
+    story.append(Spacer(1, 0.5 * cm))
+
+    story.append(section_bar("1.2  Risk & Return Summary"))
+    story.append(Spacer(1, 0.3 * cm))
+    _rm = risk_metrics(live_df)
+    risk_rows = [[k, str(v)] for k, v in _rm.items()]
+    story.append(data_table(["Metric", "Value"], risk_rows,
+                             col_widths=[inner_w * 0.6, inner_w * 0.4]))
+    story.append(Spacer(1, 0.5 * cm))
+
+    story.append(PageBreak())
+    story.append(Paragraph("2. Tesla Live Price Trend", ST_H1))
+    story.append(hr(C_RED, thickness=1.5, space_after=10))
+    story.append(section_bar("2.1  Close Price with 20-Day Moving Average"))
+    story.append(Spacer(1, 0.25 * cm))
+
+    fig1, ax1 = plt.subplots(figsize=(13, 4.5))
+    ax1.fill_between(live_df.index, live_df['Close'], alpha=0.12, color="#c0392b")
+    ax1.plot(live_df.index, live_df['Close'], color="#c0392b", lw=1.8, label="Close Price")
+    _ma20 = live_df['Close'].rolling(20).mean()
+    ax1.plot(live_df.index, _ma20, color="#e67e22", lw=1.2, ls="--", label="MA 20")
+    mpl_style(ax1, fig1)
+    ax1.set_ylabel("Price (USD)", fontsize=9)
+    ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax1.legend(fontsize=8, framealpha=0.9, edgecolor="#cccccc", fancybox=False)
+    fig1.tight_layout(pad=0.5)
+    story.append(fig_to_rl(fig1, w_cm=16, h_cm=5.5))
+    story.append(Paragraph(
+        f"Figure 1 — TSLA daily close price with 20-day moving average "
+        f"({data_from} to {data_to})", ST_CAP))
+    story.append(Spacer(1, 0.4 * cm))
+
+    story.append(section_bar("2.2  Daily Returns Distribution"))
+    story.append(Spacer(1, 0.25 * cm))
+
+    _rets = live_df['Close'].pct_change().dropna() * 100
+    fig2, ax2 = plt.subplots(figsize=(13, 3.5))
+    ax2.hist(_rets, bins=30, color="#c0392b", alpha=0.7, edgecolor="white", linewidth=0.5)
+    ax2.axvline(0,             color="#555555", lw=1.0, ls="--")
+    ax2.axvline(_rets.mean(),  color="#e67e22", lw=1.2, ls="-",  label=f"Mean {_rets.mean():.2f}%")
+    ax2.axvline(_rets.median(),color="#2980b9", lw=1.2, ls="--", label=f"Median {_rets.median():.2f}%")
+    mpl_style(ax2, fig2)
+    ax2.set_xlabel("Daily Return (%)", fontsize=9)
+    ax2.set_ylabel("Frequency",        fontsize=9)
+    ax2.legend(fontsize=8, framealpha=0.9, edgecolor="#cccccc", fancybox=False)
+    fig2.tight_layout(pad=0.5)
+    story.append(fig_to_rl(fig2, w_cm=16, h_cm=4.5))
+    story.append(Paragraph("Figure 2 — Distribution of daily percentage returns", ST_CAP))
+
+    story.append(PageBreak())
+    story.append(Paragraph("3. Next-Day Price Prediction", ST_H1))
+    story.append(hr(C_RED, thickness=1.5, space_after=10))
+
+    if not pred_available:
+        story.append(Paragraph(
+            "⚠  Prediction unavailable — no model loaded or insufficient data "
+            "(minimum 60 rows required for feature engineering).",
+            S("NM", fontSize=10, textColor=C_ORANGE)))
+    else:
+        story.append(section_bar("3.1  Prediction Metrics"))
+        story.append(Spacer(1, 0.3 * cm))
+
+        delta_sign  = "+" if change >= 0 else ""
+        pred_items  = [
+            ("Last Close Price",         f"${last_close:,.2f}",   None),
+            ("Predicted Next-Day Close", f"${pred_next:,.2f}",
+             f"{delta_sign}{change:.2f} ({delta_sign}{pct_change:.2f}%)"),
+            ("Direction",                signal,                   None),
+            ("Data as of",               str(data_to),            None),
+        ]
+        story.append(metric_cards(pred_items, cols=4))
+        story.append(Spacer(1, 0.5 * cm))
+
+        story.append(section_bar("3.2  Buy / Sell Signal"))
+        story.append(Spacer(1, 0.3 * cm))
+
+        is_buy = signal == "BUY"
+        sig_color  = C_GREEN if is_buy else C_RED
+        sig_bg     = colors.HexColor("#e8f5e9") if is_buy else colors.HexColor("#fdecea")
+        sig_icon   = "🟢  BUY" if is_buy else "🔴  SELL"
+        sig_body   = (
+            f"The model predicts a next-day close of <b>${pred_next:,.2f}</b>, which is "
+            f"<b>${abs(change):.2f} ({abs(pct_change):.2f}%)</b> "
+            f"{'above' if is_buy else 'below'} the last close of <b>${last_close:,.2f}</b>. "
+            f"This constitutes a <b>{'bullish' if is_buy else 'bearish'}</b> signal."
+        )
+
+        sig_tbl = Table(
+            [[Paragraph(sig_icon, ST_SIG_BUY if is_buy else ST_SIG_SELL),
+              Paragraph(sig_body, ST_BODY)]],
+            colWidths=[3.5 * cm, inner_w - 3.5 * cm])
+        sig_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,-1), sig_bg),
+            ("GRID",          (0,0), (-1,-1), 0.8,
+             C_GREEN if is_buy else C_RED),
+            ("TOPPADDING",    (0,0), (-1,-1), 14),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 14),
+            ("LEFTPADDING",   (0,0), (-1,-1), 12),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 12),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ("ROUNDEDCORNERS",(0,0), (-1,-1), [6,6,6,6]),
+        ]))
+        story.append(sig_tbl)
+        story.append(Spacer(1, 0.5 * cm))
+
+        story.append(Paragraph(
+            "The pre-trained Linear Regression model uses lag features (Close Lag 1–5) "
+            "and rolling statistics (7- and 30-day mean/std) to generate this forecast. "
+            "Past performance is not indicative of future results.",
+            ST_BODY))
+
+    story.append(PageBreak())
+    story.append(Paragraph("4. Recent Trading Data", ST_H1))
+    story.append(hr(C_RED, thickness=1.5, space_after=10))
+    story.append(section_bar("4.1  Last 10 Trading Days"))
+    story.append(Spacer(1, 0.3 * cm))
+
+    _recent = live_df[['Open','High','Low','Close','Volume']].tail(10).copy()
+    _recent['Daily Chg %'] = _recent['Close'].pct_change().mul(100)
+    _recent = _recent.iloc[::-1]
+
+    rec_headers = ["Date", "Open", "High", "Low", "Close", "Volume", "Chg %"]
+    rec_rows = []
+    for idx, row in _recent.iterrows():
+        chg_val = row['Daily Chg %']
+        chg_str = f"{chg_val:+.2f}%" if not np.isnan(chg_val) else "—"
+        rec_rows.append([
+            str(idx.date()),
+            f"${row['Open']:.2f}",
+            f"${row['High']:.2f}",
+            f"${row['Low']:.2f}",
+            f"${row['Close']:.2f}",
+            f"{int(row['Volume']):,}",
+            chg_str,
+        ])
+    cws = [inner_w*w for w in [0.14,0.12,0.12,0.12,0.12,0.22,0.16]]
+
+    rec_base_style = [
+        ("BACKGROUND",    (0,0),  (-1,0),  C_RED),
+        ("TEXTCOLOR",     (0,0),  (-1,0),  colors.white),
+        ("FONTNAME",      (0,0),  (-1,0),  "Helvetica-Bold"),
+        ("GRID",          (0,0),  (-1,-1), 0.5, C_BORDER),
+        ("TOPPADDING",    (0,0),  (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0),  (-1,-1), 6),
+        ("LEFTPADDING",   (0,0),  (-1,-1), 8),
+        ("FONTSIZE",      (0,0),  (-1,-1), 9),
+        ("VALIGN",        (0,0),  (-1,-1), "MIDDLE"),
+    ]
+    for i in range(len(rec_rows)):
+        bg = C_ROW_ALT if i % 2 == 0 else C_ROW_MAIN
+        rec_base_style.append(("BACKGROUND", (0, i+1), (-1, i+1), bg))
+
+    for i, row_data in enumerate(rec_rows):
+        chg_str = row_data[6]  
+        try:
+            chg_val = float(chg_str.replace("%", "").replace("+", ""))
+        except ValueError:
+            chg_val = 0.0
+        txt_color = C_GREEN if chg_val > 0 else (C_RED if chg_val < 0 else C_MUTED)
+        rec_base_style.append(("TEXTCOLOR", (6, i+1), (6, i+1), txt_color))
+        rec_base_style.append(("FONTNAME",  (6, i+1), (6, i+1), "Helvetica-Bold"))
+
+    _rec_header_row = [Paragraph(f"<b>{h}</b>",
+                                 S("TH3", fontSize=9, textColor=colors.white,
+                                   fontName="Helvetica-Bold")) for h in rec_headers]
+    _rec_data_rows  = [[Paragraph(str(c), ST_CELL) for c in row] for row in rec_rows]
+    rec_tbl = Table([_rec_header_row] + _rec_data_rows, colWidths=cws, repeatRows=1)
+    rec_tbl.setStyle(TableStyle(rec_base_style))
+    story.append(rec_tbl)
+    story.append(Spacer(1, 0.5 * cm))
+
+    story.append(section_bar("5.1  Volume Activity — Last 30 Days"))
+    story.append(Spacer(1, 0.25 * cm))
+
+    _vol_data   = live_df.tail(30).copy()
+    _vol_rets   = _vol_data['Close'].pct_change().fillna(0)
+    _vol_colors = ['#27ae60' if r >= 0 else '#c0392b' for r in _vol_rets]
+
+    fig3, ax3 = plt.subplots(figsize=(13, 3.8))
+    bars = ax3.bar(_vol_data.index, _vol_data['Volume'] / 1e6,
+                   color=_vol_colors, width=0.7, edgecolor="none")
+    mpl_style(ax3, fig3)
+    ax3.set_ylabel("Volume (millions)", fontsize=9)
+    ax3.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}M"))
+    _buy_patch  = mpatches.Patch(color='#27ae60', label='Up day')
+    _sell_patch = mpatches.Patch(color='#c0392b', label='Down day')
+    ax3.legend(handles=[_buy_patch, _sell_patch],
+               fontsize=8, framealpha=0.9, edgecolor="#cccccc", fancybox=False)
+    fig3.tight_layout(pad=0.5)
+    story.append(fig_to_rl(fig3, w_cm=16, h_cm=5))
+    story.append(Paragraph(
+        "Figure 3 — TSLA daily trading volume over the last 30 sessions "
+        "(green = price up, red = price down)", ST_CAP))
+
+    story.append(Spacer(1, 1.5 * cm))
+    story.append(hr(C_BORDER, thickness=0.8))
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(Paragraph(
+        f"End of Report  \u2014  StockVision  \u00b7  Tesla (TSLA) Live Analysis  \u00b7  "
+        f"Generated {now_str}",
+        ST_FOOT))
+
+    doc.build(story, onFirstPage=_draw_hf, onLaterPages=_draw_hf)
+    buf.seek(0)
+    return buf.read()
+
+
 df           = None
 model_bytes  = None
 source_label = ""
 load_error   = None
 info_msg     = None
 
-nav_tab0, nav_tab1, nav_tab2, nav_tab3 = st.tabs([
+nav_tab4, nav_tab0, nav_tab1, nav_tab2, nav_tab3 = st.tabs([
+    "⚡ Live Tesla",
     "Data Source & Model",
     "Dashboard",
     "EDA",
@@ -1110,7 +1628,7 @@ with nav_tab0:
         src_c1, src_c2 = st.columns([1, 2])
         source = src_c1.radio(
             "Select data source",
-            ["CSV", "JSON", "SQL Database", "Google Drive"],
+            ["CSV", "JSON", "SQL Database", "Google Drive", "Live Tesla Data"],
             label_visibility="collapsed"
         )
 
@@ -1248,6 +1766,40 @@ with nav_tab0:
                 if not drive_url.strip():
                     st.caption("Make sure the file is shared as **Anyone with the link**.")
 
+            elif source == "Live Tesla Data":
+                source_label = "LIVE"
+                if not _YF_AVAILABLE:
+                    st.markdown(
+                        "<div class='warn-box'>⚠ <strong>yfinance</strong> is not installed. "
+                        "Run <code>pip install yfinance</code> and restart the app.</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    live_period_col, live_intv_col = st.columns(2)
+                    _live_period = live_period_col.selectbox(
+                        "Period", ["1mo", "3mo", "6mo", "1y", "2y"],
+                        index=2, key="live_period_src"
+                    )
+                    _live_intv = live_intv_col.selectbox(
+                        "Interval", ["1d", "1wk"],
+                        index=0, key="live_intv_src"
+                    )
+                    _fetch_btn = st.button("🔄 Fetch Live TSLA Data", key="fetch_live_src")
+                    if _fetch_btn or st.session_state.get("live_df") is None:
+                        with st.spinner("Fetching live Tesla (TSLA) data…"):
+                            _live_df, _live_err = fetch_live_tsla_data(_live_period, _live_intv)
+                        st.session_state["live_df"]  = _live_df
+                        st.session_state["live_err"] = _live_err
+
+                    df        = st.session_state.get("live_df")
+                    load_error = st.session_state.get("live_err") if df is None else None
+                    if df is not None:
+                        st.session_state["ticker_name"] = "TESLA (LIVE)"
+                        info_msg = (
+                            f"Live TSLA data: {len(df):,} rows · "
+                            f"{df.index.min().date()} → {df.index.max().date()}"
+                        )
+
         if load_error:
             st.markdown(f"<div class='warn-box'>{load_error}</div>", unsafe_allow_html=True)
         elif df is not None:
@@ -1289,11 +1841,285 @@ with nav_tab0:
         </div>
         """, unsafe_allow_html=True)
 
+with nav_tab4:
+    st.markdown("<h1>⚡ Live Tesla (TSLA) — Real-Time Prediction</h1>", unsafe_allow_html=True)
+    st.markdown(
+        "<p style='color:#8b949e;'>Fetches live TSLA data via <strong>yfinance</strong>, "
+        "engineers features, and predicts the next-day closing price using your loaded model. "
+        "Data is cached for <strong>5 minutes</strong>.</p>",
+        unsafe_allow_html=True,
+    )
+
+    if not _YF_AVAILABLE:
+        st.error("yfinance is not installed. Run `pip install yfinance` and restart the app.")
+        st.stop()
+
+    _period_default  = st.session_state.get("live_period_tab",  "6mo")
+    _interval_default = st.session_state.get("live_intv_tab",   "1d")
+
+    with st.spinner("Loading live TSLA data…"):
+        live_df, live_err = fetch_live_tsla_data(_period_default, _interval_default)
+
+    if live_df is None:
+        st.markdown(
+            f"<div class='warn-box'>⚠ Could not load live data: {live_err}</div>",
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    if live_err:
+        st.markdown(f"<div class='warn-box'>ℹ {live_err}</div>", unsafe_allow_html=True)
+
+    ctrl_c1, ctrl_c2, ctrl_c3, ctrl_c4 = st.columns([2, 2, 2, 2])
+    live_period   = ctrl_c1.selectbox("Data Period", ["1mo","3mo","6mo","1y","2y"],
+                                      index=["1mo","3mo","6mo","1y","2y"].index(_period_default),
+                                      key="live_period_tab")
+    live_interval = ctrl_c2.selectbox("Interval",   ["1d","1h","5m"],
+                                      index=["1d","1h","5m"].index(_interval_default),
+                                      key="live_intv_tab")
+
+    with ctrl_c3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        with st.spinner(""):
+            _live_pdf_bytes_top = generate_live_tesla_pdf(
+                live_df, model_bytes,
+                live_period=live_period,
+                live_interval=live_interval,
+            )
+        st.download_button(
+            label="⬇ Download Live Tesla PDF",
+            data=_live_pdf_bytes_top,
+            file_name="stockvision_tesla_live_report.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="dl_live_tesla_pdf_top",
+        )
+
+    with ctrl_c4:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        refresh_btn = st.button("🔄 Refresh Live Data", key="live_refresh", use_container_width=True)
+
+    if refresh_btn:
+        st.cache_data.clear()
+        st.rerun()
+
+    if live_period != _period_default or live_interval != _interval_default:
+        with st.spinner("Reloading with new settings…"):
+            live_df, live_err = fetch_live_tsla_data(live_period, live_interval)
+        if live_df is None:
+            st.markdown(
+                f"<div class='warn-box'>⚠ Could not load live data: {live_err}</div>",
+                unsafe_allow_html=True,
+            )
+            st.stop()
+
+    _last_close_live  = float(live_df['Close'].iloc[-1])
+    _prev_close_live  = float(live_df['Close'].iloc[-2]) if len(live_df) > 1 else _last_close_live
+    _day_chg          = _last_close_live - _prev_close_live
+    _day_pct          = (_day_chg / _prev_close_live) * 100 if _prev_close_live else 0
+    _52w_high         = float(live_df['Close'].max())
+    _52w_low          = float(live_df['Close'].min())
+    _avg_vol          = live_df['Volume'].mean()
+
+    st.markdown("<div class='section-header'>Live Market Snapshot</div>", unsafe_allow_html=True)
+    lk1, lk2, lk3, lk4, lk5 = st.columns(5)
+    lk1.metric("Latest Close",     f"${_last_close_live:,.2f}",
+               delta=f"{_day_chg:+.2f} ({_day_pct:+.2f}%)")
+    lk2.metric("Period High",      f"${_52w_high:,.2f}")
+    lk3.metric("Period Low",       f"${_52w_low:,.2f}")
+    lk4.metric("Avg Daily Volume", f"{int(_avg_vol/1e6):.1f}M")
+    lk5.metric("Data Points",      f"{len(live_df):,}")
+
+    st.markdown("<div class='section-header'>Tesla Live Price Trend</div>", unsafe_allow_html=True)
+
+    fig_live = go.Figure()
+
+    fig_live.add_trace(go.Scatter(
+        x=live_df.index, y=live_df['Close'],
+        fill='tozeroy',
+        fillcolor='rgba(232,39,59,0.08)',
+        line=dict(color='#e8273b', width=2),
+        name='Close Price',
+        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Close: $%{y:,.2f}<extra></extra>',
+    ))
+
+    _ma20_live = live_df['Close'].rolling(20).mean()
+    fig_live.add_trace(go.Scatter(
+        x=live_df.index, y=_ma20_live,
+        line=dict(color='#f0a500', width=1.2, dash='dot'),
+        name='MA 20',
+        hovertemplate='MA20: $%{y:,.2f}<extra></extra>',
+    ))
+
+    fig_live.update_layout(
+        **PLOTLY_LAYOUT,
+        title='Tesla Live Price Trend',
+        xaxis_title='Date',
+        yaxis_title='Close Price ($)',
+        height=420,
+        legend=dict(bgcolor='rgba(0,0,0,0)'),
+        hovermode='x unified',
+    )
+    st.plotly_chart(fig_live, width="stretch")
+
+    st.markdown("<div class='section-header'>Next-Day Price Prediction</div>", unsafe_allow_html=True)
+
+    if model_bytes is None:
+        st.markdown(
+            "<div class='warn-box'>⚠ No model loaded. Upload a <strong>.pkl</strong> model "
+            "in the <strong>Data Source &amp; Model</strong> tab to enable live predictions.</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        try:
+            loaded_model_live  = pickle.loads(model_bytes)
+            required_feats_live = list(loaded_model_live.feature_names_in_)
+
+            if len(live_df) < 60:
+                st.markdown(
+                    "<div class='warn-box'>⚠ Insufficient live data rows for feature engineering "
+                    "(need ≥ 60). Try a longer period.</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                live_model_data = engineer_features(live_df)
+
+                missing_feats_live = [f for f in required_feats_live if f not in live_model_data.columns]
+                if missing_feats_live:
+                    st.error(f"Feature mismatch — live data is missing: `{missing_feats_live}`")
+                else:
+                    feature_cols_live = required_feats_live
+                    latest_row = live_model_data[feature_cols_live].iloc[-1].copy()
+                    pred_next  = loaded_model_live.predict(latest_row.values.reshape(1, -1))[0]
+
+                    live_change     = pred_next - _last_close_live
+                    live_pct_change = (live_change / _last_close_live) * 100
+
+                    pm1, pm2, pm3 = st.columns(3)
+                    pm1.metric("Last Close Price",          f"${_last_close_live:,.2f}")
+                    pm2.metric("Predicted Next-Day Close",  f"${pred_next:,.2f}",
+                               delta=f"{live_change:+.2f} ({live_pct_change:+.2f}%)")
+                    pm3.metric("Data as of",
+                               str(live_df.index[-1].date()))
+
+                    _is_buy = pred_next > _last_close_live
+                    _signal_color  = "#3fb950" if _is_buy else "#e8273b"
+                    _signal_bg     = "#0d2818" if _is_buy else "#2d0a0a"
+                    _signal_border = "#3fb950" if _is_buy else "#e8273b"
+                    _signal_icon   = "🟢" if _is_buy else "🔴"
+                    _signal_label  = "BUY" if _is_buy else "SELL"
+                    _signal_desc   = (
+                        f"Predicted price <strong>${pred_next:,.2f}</strong> is "
+                        f"<strong>above</strong> last close <strong>${_last_close_live:,.2f}</strong> — "
+                        f"bullish signal."
+                        if _is_buy else
+                        f"Predicted price <strong>${pred_next:,.2f}</strong> is "
+                        f"<strong>below</strong> last close <strong>${_last_close_live:,.2f}</strong> — "
+                        f"bearish signal."
+                    )
+
+                    st.markdown(f"""
+                    <div style="
+                        background:{_signal_bg};
+                        border-left: 5px solid {_signal_border};
+                        border-radius: 10px;
+                        padding: 20px 24px;
+                        margin: 16px 0;
+                        display: flex;
+                        align-items: center;
+                        gap: 20px;
+                    ">
+                        <div style="font-size:3rem; line-height:1;">{_signal_icon}</div>
+                        <div>
+                            <div style="font-size:1.6rem; font-weight:800;
+                                        color:{_signal_color}; letter-spacing:2px;">
+                                {_signal_label} SIGNAL
+                            </div>
+                            <div style="color:#c9d1d9; font-size:13px; margin-top:6px;">
+                                {_signal_desc}
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    st.markdown(f"""
+                    <div class='info-box'>
+                    <strong>Live Prediction Summary:</strong> Based on the pre-trained Linear Regression
+                    model with lag features and rolling statistics, the forecast for the next trading
+                    session's closing price is <strong>${pred_next:,.2f}</strong> — a change of
+                    <strong>{live_change:+.2f} ({live_pct_change:+.2f}%)</strong> from the
+                    most recent close of <strong>${_last_close_live:,.2f}</strong>.
+                    <br><br>
+                    <em>⚠ This is a model output for demonstration purposes and should not be
+                    treated as financial advice.</em>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    st.markdown("<div class='section-header'>Recent TSLA Data (Last 10 Trading Days)</div>", unsafe_allow_html=True)
+                    _recent = live_df[['Open','High','Low','Close','Volume']].tail(10).copy()
+                    _recent.index = _recent.index.date
+                    _recent['Daily Chg %'] = _recent['Close'].pct_change().mul(100).round(2)
+                    _recent = _recent.iloc[::-1]  # newest first
+                    st.dataframe(
+                        _recent.style
+                            .format({
+                                'Open':       '${:.2f}',
+                                'High':       '${:.2f}',
+                                'Low':        '${:.2f}',
+                                'Close':      '${:.2f}',
+                                'Volume':     '{:,.0f}',
+                                'Daily Chg %':'  {:.2f}%',
+                            })
+                            .applymap(
+                                lambda v: 'color: #3fb950' if isinstance(v, float) and v > 0
+                                          else ('color: #e8273b' if isinstance(v, float) and v < 0 else ''),
+                                subset=['Daily Chg %']
+                            ),
+                        use_container_width=True,
+                    )
+                    st.markdown("<div class='section-header'>Recent Volume Activity</div>", unsafe_allow_html=True)
+                    _vol_data = live_df.tail(30).copy()
+                    _vol_colors = [
+                        '#3fb950' if r > 0 else '#e8273b'
+                        for r in _vol_data['Close'].pct_change().fillna(0)
+                    ]
+                    fig_vol = go.Figure(go.Bar(
+                        x=_vol_data.index,
+                        y=_vol_data['Volume'],
+                        marker_color=_vol_colors,
+                        name='Volume',
+                        hovertemplate='<b>%{x|%Y-%m-%d}</b><br>Volume: %{y:,.0f}<extra></extra>',
+                    ))
+                    fig_vol.update_layout(
+                        **PLOTLY_LAYOUT,
+                        title='TSLA Daily Volume (Last 30 Days) — Green = Up Day, Red = Down Day',
+                        xaxis_title='Date',
+                        yaxis_title='Volume',
+                        height=320,
+                    )
+                    st.plotly_chart(fig_vol, width="stretch")
+
+                    _fetched_at = datetime.datetime.now().strftime("%H:%M:%S")
+                    st.markdown(
+                        f"<div style='color:#8b949e; font-size:11px; text-align:right; margin-top:8px;'>"
+                        f"🕒 Data cached for 5 min · Last fetched at {_fetched_at} · "
+                        f"Press <strong>Refresh Live Data</strong> to reload early.</div>",
+                        unsafe_allow_html=True,
+                    )
+
+        except Exception as _live_exc:
+            st.error(f"Live prediction error: {_live_exc}")
+            import traceback
+            st.code(traceback.format_exc())
+
 if df is None:
     for _tab in [nav_tab1, nav_tab2, nav_tab3]:
         with _tab:
             st.info("⚙️ Configure your data and model in the **Data Source & Model** tab to get started.")
+
+if df is None:
     st.stop()
+
 
 with nav_tab1:
     _ticker = st.session_state.get('ticker_name', 'Stock')
