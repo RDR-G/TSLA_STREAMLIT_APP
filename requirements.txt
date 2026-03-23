@@ -1,11 +1,7 @@
-streamlit>=1.35.0
-pandas>=2.2.0
-numpy>=1.26.0
-scikit-learn>=1.4.0
-plotly>=5.20.0
-matplotlib>=3.8.0
-reportlab>=4.1.0
-yfinance>=0.2.40
-
-# Standard-library modules
-# datetime, io, os, pickle, re, sqlite3, tempfile, warnings
+streamlit
+pandas
+numpy
+plotly
+scikit-learn
+yfinance
+reportlab
