@@ -5,3 +5,4 @@ plotly
 scikit-learn
 yfinance
 reportlab
+matplotlib
