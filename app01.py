@@ -1974,9 +1974,14 @@ with nav_tab4:
 
                     st.markdown("<div class='section-header'>Recent TSLA Data (Last 10 Trading Days)</div>", unsafe_allow_html=True)
                     _recent = live_df[['Open','High','Low','Close','Volume']].tail(10).copy()
-                    _recent.index = _recent.index.date
                     _recent['Daily Chg %'] = _recent['Close'].pct_change().mul(100).round(2)
-                    _recent = _recent.iloc[::-1] 
+                    _recent = _recent.iloc[::-1]
+                    # Reset index to integers to avoid non-unique index error with Styler,
+                    # then display date as a formatted column instead.
+                    _recent = _recent.reset_index()
+                    date_col = _recent.columns[0]  # 'Date' or 'Datetime' depending on yfinance version
+                    _recent[date_col] = pd.to_datetime(_recent[date_col]).dt.date
+                    _recent = _recent.rename(columns={date_col: 'Date'})
                     st.dataframe(
                         _recent.style
                             .format({
@@ -1987,12 +1992,13 @@ with nav_tab4:
                                 'Volume':     '{:,.0f}',
                                 'Daily Chg %':'  {:.2f}%',
                             })
-                            .applymap(
+                            .map(
                                 lambda v: 'color: #3fb950' if isinstance(v, float) and v > 0
                                           else ('color: #e8273b' if isinstance(v, float) and v < 0 else ''),
                                 subset=['Daily Chg %']
                             ),
                         use_container_width=True,
+                        hide_index=True,
                     )
 
                     st.markdown("<div class='section-header'>Recent Volume Activity</div>", unsafe_allow_html=True)
